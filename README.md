@@ -38,7 +38,7 @@ Built with Next.js, OpenAI, and Supabase pgvector. Uses Retrieval-Augmented Gene
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-org/zechubai.git
+git clone https://github.com/hyperlander/zechubai.git
 cd zechubai
 npm install
 ```

@@ -63,6 +63,12 @@ const SYSTEM_PROMPT_FALLBACK = `You are the ZecHub AI assistant — a knowledgea
 The documentation search did not return results for this question, so answer from your general knowledge about Zcash and ZecHub.
 Be accurate and helpful. Remind the user at the end of your answer that for the most up-to-date details they can visit zechub.wiki.`;
 
+// Returned directly (no OpenAI call) when the query is unrelated to ZecHub / Zcash.
+const OUT_OF_SCOPE_ANSWER =
+  "I'm ZecHub AI, specialized in answering questions about the **ZecHub wiki** and the **Zcash ecosystem** — topics like shielded transactions, ZEC, wallets, privacy features, the ZecHub DAO, and community resources.\n\n" +
+  "Your question doesn't seem to be related to those topics, so I can't provide a useful answer here.\n\n" +
+  "If you have a question about Zcash or ZecHub, feel free to ask! You can also browse the full documentation at [zechub.wiki](https://zechub.wiki).";
+
 // ---------------- Helpers ----------------
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   const timeout = new Promise<never>((_, reject) =>
@@ -133,29 +139,41 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const requestStart = Date.now();
+  console.log(`[/api/ai] → request | page=${pageUrl ?? "none"} | historyTurns=${history.length}`);
+
   try {
     const answer = await withTimeout(
       (async () => {
         // 1. Retrieve relevant doc chunks — never throws, always returns a result
-        const { chunks, searchAvailable } = await searchDocs(message, pageUrl);
+        const { chunks, searchAvailable, outOfScope } = await searchDocs(message, pageUrl);
         const hasContext = chunks.length > 0;
 
-        // 2. Choose system prompt and context injection based on what we found
+        // 2. Out-of-scope: query is unrelated to ZecHub/Zcash — return static message
+        //    immediately without spending an OpenAI token.
+        if (outOfScope) {
+          console.log(`[/api/ai] mode=OUT_OF_SCOPE | skipping OpenAI call`);
+          return OUT_OF_SCOPE_ANSWER;
+        }
+
+        // 3. Choose system prompt and context injection based on what we found
         let systemPrompt: string;
         let contextInjection: string;
 
         if (hasContext) {
           systemPrompt = SYSTEM_PROMPT_WITH_DOCS;
           contextInjection = `Use the following documentation excerpts to answer:\n\n${buildContextBlock(chunks)}`;
+          console.log(`[/api/ai] mode=RAG | chunks=${chunks.length} | searchAvailable=${searchAvailable}`);
         } else {
           systemPrompt = SYSTEM_PROMPT_FALLBACK;
           contextInjection =
             searchAvailable === null
               ? "Note: The documentation search is currently unavailable. Answer from general knowledge."
               : "Note: No documentation excerpts matched this query. Answer from general knowledge about Zcash and ZecHub.";
+          console.log(`[/api/ai] mode=FALLBACK | chunks=0 | searchAvailable=${searchAvailable}`);
         }
 
-        // 3. Assemble messages
+        // 4. Assemble messages
         const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
           { role: "system", content: systemPrompt },
           { role: "user", content: contextInjection },
@@ -166,23 +184,26 @@ export async function POST(req: NextRequest) {
           { role: "user", content: message },
         ];
 
-        // 4. Call OpenAI Responses API
+        // 5. Call OpenAI Responses API
+        const llmStart = Date.now();
         const response = await openai.responses.create({
           model: CHAT_MODEL,
           input: messages,
         });
+        console.log(`[/api/ai] OpenAI ok — ${Date.now() - llmStart}ms | model=${CHAT_MODEL}`);
 
         return response.output_text ?? "";
       })(),
       REQUEST_TIMEOUT_MS
     );
 
+    console.log(`[/api/ai] ✓ done — total=${Date.now() - requestStart}ms`);
     return NextResponse.json({ answer });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "An unexpected error occurred.";
     const isTimeout = msg === "Request timed out";
 
-    console.error("[/api/ai] error:", msg);
+    console.error(`[/api/ai] ✗ error — total=${Date.now() - requestStart}ms | ${msg}`);
     return NextResponse.json(
       { error: isTimeout ? "The request took too long. Try again." : "Failed to get answer." },
       { status: isTimeout ? 504 : 500 }

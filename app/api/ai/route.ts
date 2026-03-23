@@ -50,13 +50,16 @@ const RequestSchema = z.object({
 });
 
 // ---------------- Constants ----------------
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 
 // Used when we have retrieved doc chunks to ground the answer.
 const SYSTEM_PROMPT_WITH_DOCS = `You are the ZecHub AI assistant — an expert on Zcash and the ZecHub wiki.
-Answer the user's question using ONLY the documentation excerpts provided below.
-Be concise and accurate. When relevant, mention which section or file the information comes from.
-If the answer cannot be fully found in the provided excerpts, say what you do know from them and note that more detail may exist in the full docs.`;
+Answer the user's question using ONLY the documentation sections provided below.
+Be concise and accurate. Do NOT reference "sections", "excerpts", or numbered sources in your answer.
+After your answer, output exactly this block (replace the placeholder with the actual links given):
+
+**Sources:**
+{SOURCE_LINKS}`;
 
 // Used when vector search returned nothing (empty DB, no match, or search unavailable).
 const SYSTEM_PROMPT_FALLBACK = `You are the ZecHub AI assistant — a knowledgeable assistant about Zcash, ZecHub, and the broader Zcash ecosystem.
@@ -85,13 +88,72 @@ function getCallerIp(req: NextRequest): string {
   );
 }
 
+// Convert a stored doc path like "zechub/Using_Zcash/Transactions.md"
+// to "https://zechub.wiki/Using_Zcash/Transactions".
+function pathToWikiUrl(rawPath: string): string {
+  const withoutExt = rawPath.replace(/\.md$/i, "");
+  // Strip repo-name prefix (zechub/ or zechub-wiki/)
+  const pagePath = withoutExt
+    .replace(/^zechub-wiki\//, "")
+    .replace(/^zechub\//, "");
+  return `https://zechub.wiki/${pagePath}`;
+}
+
+// Build a human-readable page title from the file path.
+// Uses the last two meaningful path segments for context, e.g.:
+//   "zechub/Using_Zcash/Transactions.md"   → "Using Zcash — Transactions"
+//   "zechub/zechubglobal/zcashkorea/starthere/whatiszechub.md" → "Whatiszechub"
+function pathToTitle(rawPath: string): string {
+  // Strip repo prefix and extension
+  const cleaned = rawPath
+    .replace(/^zechub-wiki\//, "")
+    .replace(/^zechub\//, "")
+    .replace(/\.md$/i, "");
+
+  const parts = cleaned.split("/").filter(Boolean);
+  // Take last two segments for context (parent / filename)
+  const relevant = parts.slice(-2);
+
+  return relevant
+    .map((seg) =>
+      seg
+        // split camelCase: "zechubFrance" → "zechub France"
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        // replace underscores/hyphens with spaces
+        .replace(/[_-]+/g, " ")
+        // capitalise each word
+        .replace(/\b\w/g, (c) => c.toUpperCase())
+        .trim()
+    )
+    .join(" — ");
+}
+
 function buildContextBlock(chunks: RetrievedDocChunk[]): string {
   return chunks
     .map((c, i) => {
-      const src = c.metadata?.path ?? c.metadata?.url ?? "doc";
-      return `--- Excerpt ${i + 1} (source: ${src}) ---\n${c.content}`;
+      const path = (c.metadata?.path as string) ?? "";
+      const url = path ? pathToWikiUrl(path) : (c.metadata?.url as string) ?? "";
+      const label = path ? pathToTitle(path) : "ZecHub Wiki";
+      return `--- Section ${i + 1}: ${label} (${url}) ---\n${c.content}`;
     })
     .join("\n\n");
+}
+
+// Extract unique, deduplicated source links from chunks
+function buildSourceLinks(chunks: RetrievedDocChunk[]): string {
+  const seen = new Set<string>();
+  const links: string[] = [];
+
+  for (const chunk of chunks) {
+    const path = (chunk.metadata?.path as string) ?? "";
+    const url = path ? pathToWikiUrl(path) : (chunk.metadata?.url as string) ?? "";
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    const title = path ? pathToTitle(path) : "ZecHub Wiki";
+    links.push(`- [${title}](${url})`);
+  }
+
+  return links.join("\n");
 }
 
 // ---------------- Route handler ----------------
@@ -161,8 +223,9 @@ export async function POST(req: NextRequest) {
         let contextInjection: string;
 
         if (hasContext) {
-          systemPrompt = SYSTEM_PROMPT_WITH_DOCS;
-          contextInjection = `Use the following documentation excerpts to answer:\n\n${buildContextBlock(chunks)}`;
+          const sourceLinks = buildSourceLinks(chunks);
+          systemPrompt = SYSTEM_PROMPT_WITH_DOCS.replace("{SOURCE_LINKS}", sourceLinks);
+          contextInjection = `Use the following documentation sections to answer:\n\n${buildContextBlock(chunks)}`;
           console.log(`[/api/ai] mode=RAG | chunks=${chunks.length} | searchAvailable=${searchAvailable}`);
         } else {
           systemPrompt = SYSTEM_PROMPT_FALLBACK;

@@ -21,26 +21,35 @@ const SIMILARITY_THRESHOLD = 0.45;
 // SQL fix (run in Supabase dashboard): see sql/fix_ivfflat.sql
 // ---------------------------------------------------------------------------
 
-// Module-level embedding cache — survives between requests within the same
-// Node.js server instance (local dev + Vercel warm instances).
+// Module-level embedding cache — stored on globalThis so it survives
+// Next.js hot-module reloads in development without re-downloading.
 interface CachedEmbedding {
   id: string;
   embedding: Float32Array;
 }
 
-let _embeddingCache: CachedEmbedding[] | null = null;
-let _cacheLoadPromise: Promise<CachedEmbedding[]> | null = null;
+interface GlobalCache {
+  data: CachedEmbedding[] | null;
+  promise: Promise<CachedEmbedding[]> | null;
+}
+
+// Use a namespace on globalThis so the cache outlives module reloads.
+const g = globalThis as typeof globalThis & { __zechubEmbCache?: GlobalCache };
+if (!g.__zechubEmbCache) {
+  g.__zechubEmbCache = { data: null, promise: null };
+}
+const _cache = g.__zechubEmbCache;
 
 async function loadEmbeddingCache(
   supabase: ReturnType<typeof getSupabaseAdminClient>
 ): Promise<CachedEmbedding[]> {
-  if (_embeddingCache) return _embeddingCache;
-  if (_cacheLoadPromise) return _cacheLoadPromise;
+  if (_cache.data) return _cache.data;
+  if (_cache.promise) return _cache.promise;
 
   const loadStart = Date.now();
   console.log("[vectorSearch] cache: loading all embeddings from Supabase...");
 
-  _cacheLoadPromise = (async () => {
+  _cache.promise = (async () => {
     const chunks: CachedEmbedding[] = [];
     const PAGE_SIZE = 1000;
     let page = 0;
@@ -75,11 +84,11 @@ async function loadEmbeddingCache(
     console.log(
       `[vectorSearch] cache: loaded ${chunks.length} embeddings in ${Date.now() - loadStart}ms`
     );
-    _embeddingCache = chunks;
+    _cache.data = chunks;
     return chunks;
   })();
 
-  return _cacheLoadPromise;
+  return _cache.promise;
 }
 
 function cosineSimilarity(a: Float32Array, b: number[]): number {
@@ -184,6 +193,18 @@ export interface SearchDocsResult {
   // meaning the query is likely unrelated to ZecHub / Zcash docs.
   outOfScope: boolean;
 }
+
+// Pre-warm the embedding cache as soon as this module is first imported.
+// Runs in the background so it doesn't block server startup.
+// On Vercel warm instances the cache survives across requests; in dev it
+// survives hot-module reloads because it lives on globalThis.
+(function prewarm() {
+  if (_cache.data || _cache.promise) return; // already warm or in-flight
+  const supabase = getSupabaseAdminClient();
+  loadEmbeddingCache(supabase).catch((err) =>
+    console.error("[vectorSearch] prewarm failed:", err)
+  );
+})();
 
 export async function searchDocs(
   query: string,
